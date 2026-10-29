@@ -54,7 +54,7 @@ fn parse_port(text: &str) -> Result<u16, String> {
         Err(e) => return Err(format!("port invalide « {text} » : {e}")),
     };
 
-    // Choix de conception : nmap accepte le port 0 s'il est explicite, pas nous.
+    // le port zero n'est pas accepte ici
     if port == 0 {
         return Err("le port 0 est refusé".to_string());
     }

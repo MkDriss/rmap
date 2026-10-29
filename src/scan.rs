@@ -86,6 +86,26 @@ pub async fn scan_ports(
     results
 }
 
+/// Scanne plusieurs adresses, l'une après l'autre. Chaque hôte est scanné avec
+/// jusqu'à `concurrency` connexions simultanées (la limite vaut donc par hôte).
+///
+/// Renvoie, pour chaque IP et dans l'ordre reçu, la liste de ses ports avec leur état.
+pub async fn scan_targets(
+    ips: Vec<IpAddr>,
+    ports: Vec<u16>,
+    concurrency: usize,
+    delay: Duration,
+) -> Vec<(IpAddr, Vec<(u16, PortState)>)> {
+    let mut out = Vec::with_capacity(ips.len());
+    for ip in ips {
+        // `ports.clone()` : chaque hôte a besoin de sa propre copie de la liste,
+        // car scan_ports consomme le vecteur qu'on lui passe.
+        let states = scan_ports(ip, ports.clone(), concurrency, delay).await;
+        out.push((ip, states));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

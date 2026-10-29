@@ -1,5 +1,5 @@
 //! Point d'entrée du scanner : lit les arguments, lance le scan, affiche le bilan.
-//! Toute la logique est dans la bibliothèque (`lib.rs`, `ports.rs`, `scan.rs`).
+//! Toute la logique est dans la bibliothèque (`lib.rs`, `targets.rs`, `ports.rs`, `scan.rs`).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -8,14 +8,21 @@ use clap::Parser;
 
 // `scanner` est le nom de notre propre bibliothèque (le nom du package dans Cargo.toml).
 use scanner::ports::parse_ports;
-use scanner::scan::{PortState, scan_ports};
+use scanner::scan::{PortState, scan_targets};
+use scanner::targets::parse_targets;
 
 /// Scanner de ports TCP simple (inspiré de nmap)
 #[derive(Parser)]
 #[command(name = "scanner", about = "Scanner de ports TCP")]
 struct Args {
-    /// Adresse IP à scanner (IPv4 ou IPv6)
-    #[arg(short = 't', long = "target", default_value = "127.0.0.1")]
+    /// Cible(s) : IP, plage (192.168.1.1-50) ou bloc CIDR (192.168.1.0/24),
+    /// plusieurs séparées par des virgules
+    #[arg(
+        short = 't',
+        long = "target",
+        default_value = "127.0.0.1",
+        allow_hyphen_values = true
+    )]
     target: String,
 
     /// Ports à scanner, syntaxe nmap : 22,80,443 | 1-1024 | -100 | 60000- | -
@@ -32,7 +39,7 @@ struct Args {
     concurrency: usize,
 
     /// Délai maximal par tentative de connexion, en millisecondes
-    #[arg(short = 'T', long = "timeout-ms", default_value_t = 1500)]
+    #[arg(long = "timeout-ms", default_value_t = 1500)]
     timeout_ms: u64,
 }
 
@@ -42,10 +49,10 @@ async fn main() {
 
     // ---------- 1. Vérifier les arguments ----------
 
-    let ip = match args.target.parse::<IpAddr>() {
-        Ok(ip) => ip,
+    let ips = match parse_targets(&args.target) {
+        Ok(ips) => ips,
         Err(e) => {
-            eprintln!("Adresse IP invalide « {} » : {e}", args.target);
+            eprintln!("Cible invalide : {e}");
             std::process::exit(1);
         }
     };
@@ -66,34 +73,47 @@ async fn main() {
 
     // ---------- 2. Lancer le scan ----------
 
-    // On note le nombre de ports AVANT l'appel : scan_ports va consommer `ports`.
     let nb_ports = ports.len();
-    println!("Scan de {ip} : {nb_ports} port(s) à tester");
+    let multi = ips.len() > 1; // affichage un peu différent pour plusieurs machines
+    println!("Scan de {} machine(s) sur {nb_ports} port(s)", ips.len());
 
     let delay = Duration::from_millis(args.timeout_ms);
-    let results = scan_ports(ip, ports, args.concurrency, delay).await;
+    let results = scan_targets(ips, ports, args.concurrency, delay).await;
 
-    // Un port dont la tâche a échoué n'a pas de résultat (voir scan_ports).
-    // Il y a au plus un résultat par port, donc cette soustraction ne peut pas être négative.
-    let missing = nb_ports - results.len();
+    // ---------- 3. Afficher le bilan, groupé par machine ----------
 
-    // ---------- 3. Afficher le bilan ----------
+    for (ip, states) in results {
+        afficher_hote(ip, &states, nb_ports, multi);
+    }
+}
 
+/// Affiche le résultat d'une seule machine : ses ports ouverts, puis son bilan.
+fn afficher_hote(ip: IpAddr, states: &[(u16, PortState)], nb_ports: usize, multi: bool) {
     let mut open = Vec::new();
     let mut closed = 0u32;
     let mut filtered = 0u32;
-    let mut errors: Vec<(u16, String)> = Vec::new();
+    let mut errors: Vec<(u16, &str)> = Vec::new();
 
-    // `results` est déjà trié par port : pas besoin de retrier.
-    for (port, state) in results {
+    // states est déjà trié par port (scan_ports s'en est chargé).
+    for (port, state) in states {
         match state {
-            PortState::Open => open.push(port),
+            PortState::Open => open.push(*port),
             PortState::Closed => closed += 1,
             PortState::Filtered => filtered += 1,
-            PortState::Error(msg) => errors.push((port, msg)),
+            PortState::Error(msg) => errors.push((*port, msg)),
         }
     }
 
+    // Ports sans résultat : leur tâche a échoué (voir scan_ports).
+    let missing = nb_ports - states.len();
+
+    // Avec plusieurs machines, on n'affiche une section que si elle a quelque chose
+    // à montrer, pour ne pas noyer l'écran sous les hôtes sans port ouvert.
+    if multi && open.is_empty() && errors.is_empty() && missing == 0 {
+        return;
+    }
+
+    println!("\n=== {ip} ===");
     for port in &open {
         println!("Port {port} : OUVERT");
     }
@@ -113,8 +133,6 @@ async fn main() {
             eprintln!("  port {port} : {msg}");
         }
     }
-
-    // Ports sans aucun résultat : leur tâche a échoué (message « Une tâche a échoué » plus haut).
     if missing > 0 {
         eprintln!("⚠ Résultats incomplets : {missing} port(s) sans résultat (tâche en échec).");
     }
