@@ -1,5 +1,6 @@
 //! Scan TCP « connect » : on tente une vraie connexion sur chaque port.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -86,23 +87,114 @@ pub async fn scan_ports(
     results
 }
 
-/// Scanne plusieurs adresses, l'une après l'autre. Chaque hôte est scanné avec
-/// jusqu'à `concurrency` connexions simultanées (la limite vaut donc par hôte).
+/// Ports testés pour savoir si une machine est vivante (découverte d'hôtes).
+/// Ce sont des ports courants, dont le dernier (1883) est le MQTT du labo.
+const PROBE_PORTS: [u16; 7] = [22, 80, 443, 445, 3389, 8080, 1883];
+
+/// Scanne plusieurs machines sur plusieurs ports, toutes connexions confondues
+/// dans un seul pool de `concurrency` connexions simultanées. Une machine lente
+/// ou absente ne bloque donc plus les autres.
 ///
-/// Renvoie, pour chaque IP et dans l'ordre reçu, la liste de ses ports avec leur état.
+/// Renvoie, pour chaque IP et dans l'ordre reçu, la liste de ses ports triée.
+///
+/// # Panics
+///
+/// Panique si `concurrency` vaut 0 (voir `scan_ports`).
 pub async fn scan_targets(
     ips: Vec<IpAddr>,
     ports: Vec<u16>,
     concurrency: usize,
     delay: Duration,
 ) -> Vec<(IpAddr, Vec<(u16, PortState)>)> {
+    assert!(concurrency > 0, "concurrency doit valoir au moins 1");
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut tasks = JoinSet::new();
+
+    // Une tâche par couple (machine, port) : tout part dans le même pool.
+    for &ip in &ips {
+        for &port in &ports {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("le sémaphore n'est jamais fermé");
+            // `ip` et `port` sont Copy : le `move` les recopie, pas besoin de clone.
+            tasks.spawn(async move {
+                let state = scan_port(SocketAddr::new(ip, port), delay).await;
+                drop(permit);
+                (ip, port, state)
+            });
+        }
+    }
+
+    // On regroupe les résultats par machine dans une table.
+    let mut par_ip: HashMap<IpAddr, Vec<(u16, PortState)>> = HashMap::new();
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok((ip, port, state)) => par_ip.entry(ip).or_default().push((port, state)),
+            Err(e) => eprintln!("Une tâche a échoué : {e}"),
+        }
+    }
+
+    // On reconstruit la liste dans l'ordre des IP reçues, chaque bloc trié par port.
     let mut out = Vec::with_capacity(ips.len());
     for ip in ips {
-        // `ports.clone()` : chaque hôte a besoin de sa propre copie de la liste,
-        // car scan_ports consomme le vecteur qu'on lui passe.
-        let states = scan_ports(ip, ports.clone(), concurrency, delay).await;
+        let mut states = par_ip.remove(&ip).unwrap_or_default();
+        states.sort_unstable_by_key(|(port, _)| *port);
         out.push((ip, states));
     }
+    out
+}
+
+/// Découverte d'hôtes : renvoie, parmi `ips`, celles qui semblent vivantes.
+///
+/// Sans privilèges, on ne peut pas envoyer de ping ICMP. On considère donc
+/// qu'une machine est vivante si elle **répond** sur au moins un des ports testés :
+/// un port ouvert OU fermé prouve qu'elle est joignable (un port fermé renvoie un
+/// refus de connexion). Une machine totalement filtrée par un pare-feu, ou absente,
+/// ne répond sur aucun port et sera considérée comme éteinte.
+///
+/// # Panics
+///
+/// Panique si `concurrency` vaut 0 (voir `scan_ports`).
+pub async fn discover_hosts(ips: Vec<IpAddr>, concurrency: usize, delay: Duration) -> Vec<IpAddr> {
+    assert!(concurrency > 0, "concurrency doit valoir au moins 1");
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut tasks = JoinSet::new();
+
+    for &ip in &ips {
+        for &port in &PROBE_PORTS {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("le sémaphore n'est jamais fermé");
+            tasks.spawn(async move {
+                let state = scan_port(SocketAddr::new(ip, port), delay).await;
+                drop(permit);
+                // `matches!` : vrai si `state` correspond à l'un des motifs donnés.
+                let vivant = matches!(state, PortState::Open | PortState::Closed);
+                (ip, vivant)
+            });
+        }
+    }
+
+    // Un HashSet évite les doublons : plusieurs ports d'une même machine peuvent répondre.
+    let mut vivantes = HashSet::new();
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok((ip, true)) => {
+                vivantes.insert(ip);
+            }
+            Ok((_, false)) => {}
+            Err(e) => eprintln!("Une tâche a échoué : {e}"),
+        }
+    }
+
+    let mut out: Vec<IpAddr> = vivantes.into_iter().collect();
+    out.sort_unstable();
     out
 }
 
@@ -150,5 +242,28 @@ mod tests {
         assert!(results[0].0 < results[1].0, "résultats non triés");
         assert!(results.contains(&(port_ouvert, PortState::Open)));
         assert!(results.contains(&(port_ferme, PortState::Closed)));
+    }
+
+    #[tokio::test]
+    async fn scan_targets_groupe_et_ordonne() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let results = scan_targets(vec![ip], vec![port], 10, Duration::from_secs(1)).await;
+
+        // Une IP demandée -> une entrée en sortie, avec son port ouvert.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, ip);
+        assert_eq!(results[0].1, vec![(port, PortState::Open)]);
+    }
+
+    #[tokio::test]
+    async fn discover_trouve_une_machine_qui_repond() {
+        // 127.0.0.1 répond toujours (ports fermés -> refus de connexion),
+        // donc la découverte doit la voir comme vivante.
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let vivantes = discover_hosts(vec![ip], 10, Duration::from_secs(1)).await;
+        assert!(vivantes.contains(&ip));
     }
 }

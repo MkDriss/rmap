@@ -8,7 +8,7 @@ use clap::Parser;
 
 // `scanner` est le nom de notre propre bibliothèque (le nom du package dans Cargo.toml).
 use scanner::ports::parse_ports;
-use scanner::scan::{PortState, scan_targets};
+use scanner::scan::{PortState, discover_hosts, scan_targets};
 use scanner::targets::parse_targets;
 
 /// Scanner de ports TCP simple (inspiré de nmap)
@@ -41,6 +41,10 @@ struct Args {
     /// Délai maximal par tentative de connexion, en millisecondes
     #[arg(long = "timeout-ms", default_value_t = 1500)]
     timeout_ms: u64,
+
+    /// Repère d'abord les machines vivantes et ne scanne que celles-là
+    #[arg(long = "discover", default_value_t = false)]
+    discover: bool,
 }
 
 #[tokio::main]
@@ -71,16 +75,34 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // ---------- 2. Lancer le scan ----------
+    let delay = Duration::from_millis(args.timeout_ms);
+
+    // ---------- 2. Découverte d'hôtes (optionnelle) ----------
+
+    let ips = if args.discover {
+        println!("Découverte sur {} machine(s)...", ips.len());
+        let vivantes = discover_hosts(ips, args.concurrency, delay).await;
+        println!("{} machine(s) vivante(s) :", vivantes.len());
+        for ip in &vivantes {
+            println!("  {ip}");
+        }
+        if vivantes.is_empty() {
+            return; // rien à scanner
+        }
+        vivantes
+    } else {
+        ips
+    };
+
+    // ---------- 3. Lancer le scan ----------
 
     let nb_ports = ports.len();
     let multi = ips.len() > 1; // affichage un peu différent pour plusieurs machines
-    println!("Scan de {} machine(s) sur {nb_ports} port(s)", ips.len());
+    println!("\nScan de {} machine(s) sur {nb_ports} port(s)", ips.len());
 
-    let delay = Duration::from_millis(args.timeout_ms);
     let results = scan_targets(ips, ports, args.concurrency, delay).await;
 
-    // ---------- 3. Afficher le bilan, groupé par machine ----------
+    // ---------- 4. Afficher le bilan, groupé par machine ----------
 
     for (ip, states) in results {
         afficher_hote(ip, &states, nb_ports, multi);
