@@ -6,14 +6,13 @@ use std::time::Duration;
 
 use clap::Parser;
 
-// `scanner` est le nom de notre propre bibliothèque (le nom du package dans Cargo.toml).
-use scanner::ports::parse_ports;
-use scanner::scan::{PortState, discover_hosts, scan_targets};
-use scanner::targets::parse_targets;
+use rmap::ports::parse_ports;
+use rmap::scan::{PortState, discover_hosts, scan_targets};
+use rmap::targets::parse_targets;
 
 /// Scanner de ports TCP simple (inspiré de nmap)
 #[derive(Parser)]
-#[command(name = "scanner", about = "Scanner de ports TCP")]
+#[command(name = "rmap", about = "Scanner de ports TCP")]
 struct Args {
     /// Cible(s) : IP, plage (192.168.1.1-50) ou bloc CIDR (192.168.1.0/24),
     /// plusieurs séparées par des virgules
