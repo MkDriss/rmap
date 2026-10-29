@@ -12,7 +12,8 @@ Il essaie de se connecter à chaque port d'une ou plusieurs machines et dit lesq
 ## Ce que fait l'outil
 
 - Scanne **une ou plusieurs machines** : une IP, une plage, ou un bloc réseau (CIDR).
-- Teste beaucoup de ports **en parallèle** (avec `tokio`), au lieu d'un par un.
+- Peut d'abord **repérer les machines vivantes** d'un réseau avant de les scanner (`--discover`).
+- Teste beaucoup de ports (et de machines) **en parallèle** (avec `tokio`), au lieu d'un par un.
 - Abandonne un port qui ne répond pas après un **délai** (timeout).
 - Accepte les listes de ports **comme nmap** : `22,80,443`, `1-1024`, `-` (tous).
 - Classe chaque port : **ouvert**, **fermé**, **filtré** ou **erreur**.
@@ -49,9 +50,12 @@ Sans option, il scanne les ports **1 à 1024** de **127.0.0.1** (votre propre ma
 | --- | --- | --- | --- |
 | `-t`, `--target` | Machine(s) à scanner | `127.0.0.1` | `-t 192.168.50.0/24` |
 | `-p`, `--ports` | Ports à scanner | `1-1024` | `-p 22,80,443` |
-| `-c`, `--concurrency` | Nombre de connexions en même temps | `500` | `-c 100` |
+| `-c`, `--concurrency` | Nombre total de connexions en même temps | `500` | `-c 100` |
 | `--timeout-ms` | Temps d'attente max par port (millisecondes) | `1500` | `--timeout-ms 500` |
+| `--discover` | Repère d'abord les machines vivantes, puis ne scanne que celles-là | désactivé | `--discover` |
 | `-h`, `--help` | Affiche l'aide | — | `--help` |
+
+`--concurrency` est une limite **globale** : au plus ce nombre de connexions sont ouvertes à la fois, toutes machines et tous ports confondus.
 
 ### Choisir la ou les machines (`-t`)
 
@@ -81,6 +85,29 @@ Pour éviter un scan lancé par erreur sur un réseau énorme, un bloc CIDR est 
 
 Les ports en double sont ignorés. Les tests sont lancés dans l'ordre croissant des ports.
 
+### Repérer les machines vivantes (`--discover`)
+
+Scanner tous les ports de chaque adresse d'un réseau est lent quand la plupart des adresses sont vides : chaque machine absente fait attendre le timeout. L'option `--discover` ajoute une étape rapide avant le scan : elle teste quelques ports courants sur chaque adresse, ne garde que les machines qui **répondent**, puis ne scanne que celles-là.
+
+```bash
+./target/release/scanner -t 192.168.50.0/24 --discover -p 22,80,443,8080
+```
+
+```
+Découverte sur 256 machine(s)...
+3 machine(s) vivante(s) :
+  192.168.50.1
+  192.168.50.2
+  192.168.50.10
+
+Scan de 3 machine(s) sur 4 port(s)
+...
+```
+
+Sans privilèges (pas de `sudo`), on ne peut pas envoyer de ping ICMP. Une machine est donc considérée vivante si elle répond sur au moins un port : un port ouvert **ou** fermé prouve qu'elle est joignable (un port fermé renvoie un refus de connexion). Conséquence : une machine dont un pare-feu bloque tous les ports sans jamais répondre sera considérée comme éteinte et ignorée.
+
+La découverte n'est **pas** activée par défaut, pour deux raisons : sur une seule cible elle ne sert à rien, et un outil de sécurité ne doit pas masquer des machines sans que vous l'ayez demandé.
+
 ### Exemples
 
 ```bash
@@ -95,6 +122,9 @@ Les ports en double sont ignorés. Les tests sont lancés dans l'ordre croissant
 
 # Scanner un réseau entier sur quelques ports courants
 ./target/release/scanner -t 192.168.50.0/24 -p 22,80,443,8080
+
+# Repérer d'abord les machines vivantes, puis ne scanner qu'elles (bien plus rapide)
+./target/release/scanner -t 192.168.50.0/24 --discover -p 22,80,443,8080
 
 # Scanner une plage de machines
 ./target/release/scanner -t 192.168.50.1-50 -p 22,80
@@ -171,7 +201,8 @@ Les tests vérifient notamment :
 
 - **TCP uniquement** : pas de scan UDP.
 - **Adresses IP seulement** comme cible : les noms de domaine (`exemple.com`) ne sont pas acceptés.
-- Les machines sont scannées **l'une après l'autre** (les ports d'une même machine, eux, sont testés en parallèle). Scanner un grand réseau dont beaucoup d'adresses sont absentes est donc lent : chaque machine absente fait attendre le timeout. La découverte des machines vivantes est prévue pour corriger ce point.
+- Scanner tous les ports d'un grand réseau reste long même si tout se fait en parallèle, car chaque adresse absente fait attendre le timeout. Utilisez `--discover` pour éliminer d'abord les adresses vides.
+- La **découverte** (`--discover`) rate une machine dont un pare-feu bloque tous les ports sans répondre : elle est alors considérée comme éteinte. C'est une limite de toute découverte sans privilège.
 - Le scan est un « TCP connect » : il ouvre une vraie connexion complète, qui est donc visible par la machine scannée (elle peut apparaître dans ses journaux).
 - Pas de détection du service ou de sa version (l'outil dit qu'un port est ouvert, pas ce qui tourne dessus).
 - Par rapport à nmap : pas de noms de services dans `-p` (`-p ssh`), pas de port 0, et les tests sont lancés dans l'ordre croissant au lieu d'un ordre aléatoire.
