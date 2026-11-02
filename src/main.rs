@@ -1,11 +1,14 @@
 //! Point d'entrée du scanner : lit les arguments, lance le scan, affiche le bilan.
 //! Toute la logique est dans la bibliothèque (`lib.rs`, `targets.rs`, `ports.rs`, `scan.rs`).
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use clap::Parser;
 
+// `rmap` est le nom de notre propre bibliothèque (le nom du package dans Cargo.toml).
+use rmap::names::resolve_names;
 use rmap::ports::parse_ports;
 use rmap::scan::{PortState, discover_hosts, scan_targets};
 use rmap::targets::parse_targets;
@@ -44,7 +47,14 @@ struct Args {
     /// Repère d'abord les machines vivantes et ne scanne que celles-là
     #[arg(long = "discover", default_value_t = false)]
     discover: bool,
+
+    /// Ne cherche pas le nom des machines (pas de résolution DNS inverse)
+    #[arg(short = 'n', long = "no-dns", default_value_t = false)]
+    no_dns: bool,
 }
+
+/// Délai maximal pour trouver le nom d'une machine.
+const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
@@ -78,12 +88,20 @@ async fn main() {
 
     // ---------- 2. Découverte d'hôtes (optionnelle) ----------
 
+    // Table « IP → nom », remplie à la découverte ou après le scan (voir étape 4).
+    let mut names = HashMap::new();
+
     let ips = if args.discover {
         println!("Découverte sur {} machine(s)...", ips.len());
         let vivantes = discover_hosts(ips, args.concurrency, delay).await;
+
+        // On cherche le nom des machines vivantes dès maintenant, pour les afficher dans la liste.
+        if !args.no_dns {
+            names = resolve_names(&vivantes, DNS_TIMEOUT).await;
+        }
         println!("{} machine(s) vivante(s) :", vivantes.len());
         for ip in &vivantes {
-            println!("  {ip}");
+            println!("  {}", libelle(*ip, names.get(ip)));
         }
         if vivantes.is_empty() {
             return; // rien à scanner
@@ -101,15 +119,40 @@ async fn main() {
 
     let results = scan_targets(ips, ports, args.concurrency, delay).await;
 
-    // ---------- 4. Afficher le bilan, groupé par machine ----------
+    // ---------- 4. Garder les machines à afficher et chercher leur nom ----------
 
-    for (ip, states) in results {
-        afficher_hote(ip, &states, nb_ports, multi);
+    // Avec plusieurs machines, on n'affiche que celles qui ont quelque chose à montrer.
+    let results: Vec<_> = results
+        .into_iter()
+        .filter(|(_, states)| !multi || a_afficher(states, nb_ports))
+        .collect();
+
+    // Sans découverte, les noms n'ont pas encore été cherchés : on le fait maintenant,
+    // seulement pour les machines retenues. Avec découverte, ils sont déjà connus.
+    if !args.no_dns && !args.discover {
+        let ips: Vec<IpAddr> = results.iter().map(|(ip, _)| *ip).collect();
+        names = resolve_names(&ips, DNS_TIMEOUT).await;
+    }
+
+    // ---------- 5. Afficher le bilan, groupé par machine ----------
+
+    for (ip, states) in &results {
+        // `get` renvoie Some(nom) si un nom a été trouvé pour cette IP, None sinon.
+        let name = names.get(ip);
+        afficher_hote(*ip, name, states, nb_ports);
     }
 }
 
+/// Vrai si une machine a quelque chose à montrer : un port ouvert ou un résultat incomplet.
+fn a_afficher(states: &[(u16, PortState)], nb_ports: usize) -> bool {
+    let has_open = states.iter().any(|(_, s)| *s == PortState::Open);
+    let has_error = states.iter().any(|(_, s)| matches!(s, PortState::Error(_)));
+    let missing = states.len() < nb_ports;
+    has_open || has_error || missing
+}
+
 /// Affiche le résultat d'une seule machine : ses ports ouverts, puis son bilan.
-fn afficher_hote(ip: IpAddr, states: &[(u16, PortState)], nb_ports: usize, multi: bool) {
+fn afficher_hote(ip: IpAddr, name: Option<&String>, states: &[(u16, PortState)], nb_ports: usize) {
     let mut open = Vec::new();
     let mut closed = 0u32;
     let mut filtered = 0u32;
@@ -128,13 +171,8 @@ fn afficher_hote(ip: IpAddr, states: &[(u16, PortState)], nb_ports: usize, multi
     // Ports sans résultat : leur tâche a échoué (voir scan_ports).
     let missing = nb_ports - states.len();
 
-    // Avec plusieurs machines, on n'affiche une section que si elle a quelque chose
-    // à montrer, pour ne pas noyer l'écran sous les hôtes sans port ouvert.
-    if multi && open.is_empty() && errors.is_empty() && missing == 0 {
-        return;
-    }
-
-    println!("\n=== {ip} ===");
+    // En-tête façon nmap : le nom s'il est connu, puis l'adresse entre parenthèses.
+    println!("\n=== {} ===", libelle(ip, name));
     for port in &open {
         println!("Port {port} : OUVERT");
     }
@@ -156,5 +194,13 @@ fn afficher_hote(ip: IpAddr, states: &[(u16, PortState)], nb_ports: usize, multi
     }
     if missing > 0 {
         eprintln!("⚠ Résultats incomplets : {missing} port(s) sans résultat (tâche en échec).");
+    }
+}
+
+/// Texte qui désigne une machine, façon nmap : « nom (ip) » si le nom est connu, sinon « ip ».
+fn libelle(ip: IpAddr, name: Option<&String>) -> String {
+    match name {
+        Some(name) => format!("{name} ({ip})"),
+        None => ip.to_string(),
     }
 }

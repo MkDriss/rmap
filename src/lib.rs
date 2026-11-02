@@ -7,6 +7,7 @@
 //!
 //! Le binaire (`main.rs`) ne fait que lire les arguments et afficher les résultats.
 
+pub mod names;
 pub mod ports;
 pub mod scan;
 pub mod targets;
